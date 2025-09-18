@@ -1,0 +1,18 @@
+{
+  "name": "kaya-md",
+  "version": "1.0.0",
+  "description": "KAYA-MD adapted for Render (WhatsApp bot with QR web)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "author": "TonNom <ton@email>",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^4.0.0",
+    "express": "^4.18.2",
+    "qrcode": "^1.5.1",
+    "pino": "^8.14.0"
+  }
+}

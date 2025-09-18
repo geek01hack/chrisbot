@@ -1,0 +1,8 @@
+node_modules/
+.env
+auth_info_multi.json
+auth_info_single.json
+auth_info_multi.js
+auth_info_single.js
+.DS_Store
+npm-debug.log

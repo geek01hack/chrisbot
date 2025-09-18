@@ -1,9 +1,15 @@
 /**
- * index.js — KAYA-MD (version adaptée Render + QR web)
+ * index.js — KAYA-MD (adapté pour Baileys v6+ et Render)
  *
- * 1) npm install @whiskeysockets/baileys qrcode express pino
- * 2) Déployer sur Render (Web Service) avec start: "node index.js"
- * 3) Ouvre l'URL fournie par Render et scanne le QR affiché.
+ * - Utilise `useMultiFileAuthState` (créera un dossier auth_info/)
+ * - Expose une page HTTP "/" qui affiche le QR (DataURL) pour scanner
+ * - Sauvegarde automatiquement les credentials via saveCreds
+ *
+ * Avant d'exécuter:
+ * npm install
+ * npm start
+ *
+ * Sécurité: n'ajoute pas le dossier auth_info/ au dépôt (ajoute au .gitignore).
  */
 
 const fs = require('fs');
@@ -12,22 +18,19 @@ const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
 
-const baileys = require('@whiskeysockets/baileys');
 const {
   default: makeWASocket,
-  useSingleFileAuthState,
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
   makeInMemoryStore
-} = baileys;
+} = require('baileys');
 
 const PORT = process.env.PORT || 3000;
-const AUTH_FILE = process.env.AUTH_FILE_PATH || './auth_info_multi.json';
+const AUTH_DIR = process.env.AUTH_DIR || './auth_info'; // dossier créé par useMultiFileAuthState
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-/* ------------------------------------------------------
-   Express (page QR)
-   ------------------------------------------------------ */
+/* ---------------- Express & UI QR ---------------- */
 const app = express();
 let latestQRCodeDataUrl = null;
 let qrLastUpdated = null;
@@ -37,15 +40,12 @@ app.get('/', (req, res) => {
   if (!latestQRCodeDataUrl) {
     return res.send(`
       <html>
-        <head>
-          <meta http-equiv="refresh" content="5">
-          <title>KAYA-MD — QR</title>
-        </head>
+        <head><meta http-equiv="refresh" content="5"><title>KAYA-MD — QR</title></head>
         <body style="font-family: Arial, sans-serif; text-align:center; padding:40px">
           <h1>KAYA-MD</h1>
           <h2>Status: ${connectionStatus}</h2>
-          <p>En attente du QR… cette page se rafraîchit toutes les 5s.</p>
-          <p>Si rien n'apparaît, regarde les logs (Render / console) pour voir les erreurs.</p>
+          <p>En attente du QR… la page se rafraîchit toutes les 5s.</p>
+          <p>Regarde les logs si rien n'apparait.</p>
         </body>
       </html>
     `);
@@ -53,17 +53,13 @@ app.get('/', (req, res) => {
 
   res.send(`
     <html>
-      <head>
-        <title>KAYA-MD — QR</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-      </head>
+      <head><title>KAYA-MD — QR</title><meta name="viewport" content="width=device-width, initial-scale=1"></head>
       <body style="font-family: Arial, sans-serif; text-align:center; padding:20px">
         <h1>KAYA-MD</h1>
         <h3>Status: ${connectionStatus}</h3>
         <p>Dernière génération: ${qrLastUpdated}</p>
-        <img src="${latestQRCodeDataUrl}" alt="WhatsApp QR Code" style="max-width:90%;height:auto"/>
-        <p style="margin-top:12px">Scanne ce QR avec WhatsApp (Menu > Appareils liés > Scanner).</p>
-        <p style="font-size:12px; color:#666">NB: Si le QR expire, reviens sur cette page pour voir la nouvelle image.</p>
+        <img src="${latestQRCodeDataUrl}" alt="WhatsApp QR" style="max-width:90%;height:auto;"/>
+        <p style="margin-top:12px">Scanner avec WhatsApp → Menu > Appareils liés > Scanner un code</p>
       </body>
     </html>
   `);
@@ -73,29 +69,22 @@ app.get('/health', (req, res) => {
   res.json({ status: connectionStatus, qrLastUpdated });
 });
 
-/* ------------------------------------------------------
-   Baileys + Auth
-   ------------------------------------------------------ */
-const { state, saveState } = useSingleFileAuthState(AUTH_FILE);
+/* ---------------- Baileys + auth ---------------- */
 
-let store;
-try {
-  store = makeInMemoryStore ? makeInMemoryStore({ logger: pino().child({ level: 'silent' }) }) : null;
-} catch (e) {
-  store = null;
-}
-
-async function startSock() {
+async function startSocket() {
   try {
     connectionStatus = 'fetching-baileys-version';
     let version = [2, 2204, 13];
     try {
       const fetched = await fetchLatestBaileysVersion();
       if (fetched && Array.isArray(fetched.version)) version = fetched.version;
-      logger.info('Baileys version fetched', { version });
+      logger.info('Baileys version:', { version });
     } catch (err) {
-      logger.warn('Could not fetch latest baileys version, using fallback.');
+      logger.warn('Impossible de récupérer la dernière version de Baileys, fallback utilisé.');
     }
+
+    // useMultiFileAuthState crée/charge un dossier (ex: auth_info/)
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     connectionStatus = 'starting-socket';
     const sock = makeWASocket({
@@ -105,32 +94,44 @@ async function startSock() {
       version
     });
 
-    if (store && store.bind) store.bind(sock.ev);
+    // sauvegarde automatique des cred quand elles changent
+    sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('creds.update', saveState);
+    // optionnel : store mémoire (si besoin)
+    let store = null;
+    try {
+      if (makeInMemoryStore) {
+        store = makeInMemoryStore({ logger: pino().child({ level: 'silent' }) });
+        if (store && store.bind) store.bind(sock.ev);
+      }
+    } catch (e) {
+      logger.debug('store non chargé:', e);
+    }
 
+    // connection update handler
     sock.ev.on('connection.update', async (update) => {
       try {
         const { connection, lastDisconnect, qr } = update;
+
         if (qr) {
           try {
             latestQRCodeDataUrl = await QRCode.toDataURL(qr);
             qrLastUpdated = new Date().toISOString();
-            logger.info('QR généré et exposé via HTTP /');
             connectionStatus = 'qr-generated';
-          } catch (qerr) {
-            logger.error('Erreur génération QR DataURL:', qerr);
+            logger.info('QR généré et exposé via HTTP /');
+          } catch (qErr) {
+            logger.error('Erreur conversion QR -> DataURL:', qErr);
           }
         }
 
         if (connection) {
           connectionStatus = connection;
           logger.info('connection.update', { connection });
-
+          // Lorsque connection ouverte, enlever le QR
           if (connection === 'open') {
-            logger.info('Connection ouverte — authentification réussie');
             latestQRCodeDataUrl = null;
             qrLastUpdated = new Date().toISOString();
+            logger.info('Session ouverte. Auth saved.');
           }
         }
 
@@ -139,16 +140,24 @@ async function startSock() {
           logger.warn('lastDisconnect:', err && err.output ? err.output.payload : err);
 
           const code = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
+          // comportements selon le code
           if (code === DisconnectReason.badSession || code === DisconnectReason.loggedOut) {
-            logger.warn('Session invalide. Suppression du fichier d\'auth et redémarrage pour re-login.');
-            try { fs.unlinkSync(AUTH_FILE); } catch (e) { logger.error('Impossible de supprimer le fichier auth:', e); }
-            setTimeout(() => startSock(), 2000);
+            logger.warn('Session invalide. Suppression du dossier d\'auth et redémarrage pour re-login.');
+            try {
+              // supprime les fichiers d'auth (auth_info/*)
+              if (fs.existsSync(AUTH_DIR)) {
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+              }
+            } catch (e) {
+              logger.error('Impossible de supprimer auth dir:', e);
+            }
+            setTimeout(() => startSocket(), 2000);
           } else if (code === DisconnectReason.restartRequired || code === DisconnectReason.connectionClosed) {
             logger.info('Redémarrage du socket...');
-            setTimeout(() => startSock(), 2000);
+            setTimeout(() => startSocket(), 2000);
           } else {
             logger.info('Tentative de reconnexion dans 5s...');
-            setTimeout(() => startSock(), 5000);
+            setTimeout(() => startSocket(), 5000);
           }
         }
       } catch (e) {
@@ -156,35 +165,37 @@ async function startSock() {
       }
     });
 
+    // messages handler (exemple minimal)
     sock.ev.on('messages.upsert', async (m) => {
       try {
         const messages = m.messages || [];
         for (const msg of messages) {
           if (!msg.message) continue;
           const from = msg.key.remoteJid;
-          logger.info('Message reçu', { from, content: Object.keys(msg.message)[0] });
-          // exemple de réponse (désactivé par défaut)
+          logger.info('Message reçu', { from, type: Object.keys(msg.message)[0] });
+          // Exemple réponse (désactivée)
           // if (msg.message.conversation) {
           //   await sock.sendMessage(from, { text: 'OK' }, { quoted: msg });
           // }
         }
-      } catch (e) {
-        logger.error('Erreur messages.upsert:', e);
+      } catch (err) {
+        logger.error('Erreur messages.upsert:', err);
       }
     });
 
+    logger.info('Socket initialisé.');
     return sock;
   } catch (err) {
-    logger.error('Erreur startSock:', err);
-    setTimeout(() => startSock(), 5000);
+    logger.error('Erreur startSocket():', err);
+    setTimeout(() => startSocket(), 5000);
   }
 }
 
-/* start everything */
+/* ---------------- démarrage serveur + socket ---------------- */
 (async () => {
   app.listen(PORT, () => {
     logger.info(`HTTP server pour QR en écoute sur le port ${PORT}`);
   });
 
-  await startSock();
+  await startSocket();
 })();
